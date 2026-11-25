@@ -12,6 +12,16 @@ import time
 import modal
 
 APP_NAME = "flux-studio"
+# Hardened fork (redzerat, 2026-11-25): Hugging Face revisions pinned to the
+# commit SHAs read from the HF API on 2026-11-25. Update deliberately, never float.
+REV_FLUX = "e7b7dc27f91deacad38e78976d1f2b499d76a294"
+REV_FLUX_ENCODER = "531dfe4c32ddcc6ec3aa1e146da905780281caf9"
+REV_RV = "9a857a696b9aabbf509073e0aa55ec8200b6ef7d"
+REV_VAE = "31f26fdeee1355a5c34592e401dd41e45d25a493"
+REV_XL = "368374c797ebe7366781ce57c0ad92102ad69dd3"
+REV_CHROMA = "0e0c60ece1e82b17cb7f77342d765ba5024c40c0"
+REV_PONY = "def953b220844d4e1cee8bb8fbd8d56a1dfbabb1"
+REV_FACEID = "43907e6f44d079bf1a9102d9a6e56aef7a219bae"
 MODEL_ID = "black-forest-labs/FLUX.2-klein-4B"
 # Second engine: Realistic Vision V6.0 B1 (SD1.5 community fine-tune).
 # Uncensored by training, follows adult glamour prompts FLUX klein cannot.
@@ -124,7 +134,7 @@ class Generator:
         from huggingface_hub import hf_hub_download
 
         self.pipe = Flux2KleinPipeline.from_pretrained(
-            MODEL_ID, torch_dtype=torch.bfloat16
+            MODEL_ID, torch_dtype=torch.bfloat16, revision=REV_FLUX
         )
         # Uncensored (abliterated) Qwen3 text encoder replaces the stock
         # safety-aligned one. Probe-verified 2026-11-12: its state dict loads
@@ -132,6 +142,7 @@ class Generator:
         p = hf_hub_download(
             "PinoCookie/Flux.2-klein-4B-abliterated-text-encoder",
             "text_encoder.pt",
+            revision=REV_FLUX_ENCODER,
             local_dir="/models/abliterated",
         )
         sd = torch.load(p, map_location="cpu", weights_only=True)
@@ -151,7 +162,7 @@ class Generator:
         from diffusers import DPMSolverMultistepScheduler, StableDiffusionXLPipeline
 
         self.pipe_xl = StableDiffusionXLPipeline.from_pretrained(
-            XL_MODEL_ID, torch_dtype=torch.float16
+            XL_MODEL_ID, torch_dtype=torch.float16, revision=REV_XL
         )
         self.pipe_xl.scheduler = DPMSolverMultistepScheduler.from_config(
             self.pipe_xl.scheduler.config, use_karras_sigmas=True
@@ -194,6 +205,7 @@ class Generator:
         if not self.xl_face_on:
             self.pipe_xl.load_ip_adapter(
                 "h94/IP-Adapter-FaceID",
+                revision=REV_FACEID,
                 subfolder="",
                 weight_name="ip-adapter-faceid_sdxl.bin",
                 image_encoder_folder=None,
@@ -234,10 +246,12 @@ class Generator:
                 ckpt = hf_hub_download(
                     RV_MODEL_ID,
                     "Realistic_Vision_V6.0_NV_B1_fp16.safetensors",
+                    revision=REV_RV,
                     local_dir="/models/rv",
                 )
                 vae = AutoencoderKL.from_pretrained(
-                    "stabilityai/sd-vae-ft-mse", torch_dtype=torch.float16
+                    "stabilityai/sd-vae-ft-mse", torch_dtype=torch.float16,
+                    revision=REV_VAE
                 )
                 self.pipe_rv = StableDiffusionPipeline.from_single_file(
                     ckpt, vae=vae, torch_dtype=torch.float16, safety_checker=None
@@ -303,7 +317,7 @@ class Generator:
                 from diffusers import ChromaPipeline
 
                 self.pipe_chroma = ChromaPipeline.from_pretrained(
-                    CHROMA_ID, torch_dtype=torch.bfloat16
+                    CHROMA_ID, torch_dtype=torch.bfloat16, revision=REV_CHROMA
                 )
                 self.pipe_chroma.enable_model_cpu_offload()
                 volume.commit()
@@ -330,7 +344,8 @@ class Generator:
                 from huggingface_hub import hf_hub_download
 
                 ckpt = hf_hub_download(
-                    PONY_ID, PONY_FILE, local_dir="/models/pony"
+                    PONY_ID, PONY_FILE, local_dir="/models/pony",
+                    revision=REV_PONY
                 )
                 self.pipe_pony = StableDiffusionXLPipeline.from_single_file(
                     ckpt, torch_dtype=torch.float16
@@ -388,13 +403,20 @@ class Generator:
 @modal.asgi_app()
 def web():
     import base64
+    import secrets
 
     from fastapi import FastAPI, Header, HTTPException, Request
 
     api = FastAPI()
 
     def check(token):
-        if token != os.environ.get("AUTH_TOKEN", ""):
+        # Hardened: fail closed when the secret is missing/empty (upstream
+        # compared empty header == empty env and let the request through),
+        # and compare in constant time.
+        expected = os.environ.get("AUTH_TOKEN", "")
+        if not expected:
+            raise HTTPException(status_code=503, detail="auth not configured")
+        if not secrets.compare_digest(token or "", expected):
             raise HTTPException(status_code=401, detail="bad token")
 
     def translate_zh(text: str):
@@ -445,13 +467,22 @@ def web():
         prompt = str(body.get("prompt", "")).strip()
         if not prompt:
             raise HTTPException(status_code=400, detail="prompt required")
+        if len(prompt) > 2000:
+            raise HTTPException(status_code=400, detail="prompt too long (max 2000 chars)")
         prompt_in = prompt
         translated = False
+        translation_disabled = False
         if any("一" <= ch <= "鿿" for ch in prompt):
-            t = translate_zh(prompt)
-            if t:
-                prompt = t
-                translated = True
+            # Hardened: upstream sent Chinese prompts in plaintext to Google
+            # and MyMemory by default. Translation is now OFF unless the
+            # operator explicitly sets TRANSLATE_ZH=1 on the web function.
+            if os.environ.get("TRANSLATE_ZH", "") == "1":
+                t = translate_zh(prompt)
+                if t:
+                    prompt = t
+                    translated = True
+            else:
+                translation_disabled = True
         width = max(256, min(1536, int(body.get("width", 1024))))
         height = max(256, min(1536, int(body.get("height", 1024))))
         width -= width % 16
@@ -480,6 +511,7 @@ def web():
             "prompt_in": prompt_in,
             "prompt_used": prompt,
             "translated": translated,
+            "translation_disabled": translation_disabled,
         }
 
     @api.get("/result/{call_id}")
